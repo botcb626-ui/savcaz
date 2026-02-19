@@ -4,9 +4,9 @@ import os
 
 # --- НАСТРОЙКИ БОТА ---
 TOKEN = os.getenv('BOT_TOKEN')                     # Токен Telegram бота берётся из переменной окружения
-API_CRYPTOBOT = '534705:AAb8W3NhO7JxjTY3mvYUDjGixYfnhLxBaMo'    # Токен из Crypto Bot (@CryptoBot) — для создания инвойсов
-CHANNEL_ID = -1003755720528                    # ID вашего игрового канала (начинается с -100)
-ADMIN_IDS = [8035506201]                        # Список ID администраторов через запятую (например, ваш ID)
+API_CRYPTOBOT = '534704:AAHQevelB7uFHf77O0NynwvzauV813iLl5g'    # Токен из Crypto Bot (@CryptoBot) — для создания инвойсов
+CHANNEL_ID = -1003873600338                    # ID вашего игрового канала (начинается с -100)
+ADMIN_IDS = [5559518385]                        # Список ID администраторов через запятую (например, ваш ID)
 
 # --- ССЫЛКИ (НОВЫЕ) ---
 SUPPORT_USERNAME = "dspiq"                     # Юзернейм поддержки (без @)
