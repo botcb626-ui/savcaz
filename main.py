@@ -10,9 +10,10 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, PreCheckoutQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiocryptopay import AioCryptoPay, Networks
+from aiogram.exceptions import TelegramBadRequest
 
 import config
 
@@ -111,6 +112,51 @@ def get_all_users():
     conn.close()
     return [row[0] for row in rows]
 
+# ========== ПРОВЕРКА ПОДПИСКИ ==========
+async def check_subscription(user_id: int) -> bool:
+    """Проверяет, подписан ли пользователь на канал."""
+    try:
+        member = await bot.get_chat_member(chat_id=f"@{config.CHANNEL_USERNAME}", user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except TelegramBadRequest as e:
+        print(f"Ошибка проверки подписки: {e}")
+        return False
+    except Exception as e:
+        print(f"Неизвестная ошибка: {e}")
+        return False
+
+def subscription_required(handler):
+    """Декоратор для проверки подписки перед выполнением хендлера."""
+    async def wrapper(event, *args, **kwargs):
+        user_id = None
+        if isinstance(event, types.CallbackQuery):
+            user_id = event.from_user.id
+        elif isinstance(event, types.Message):
+            user_id = event.from_user.id
+        if not user_id:
+            return
+        if not await check_subscription(user_id):
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{config.CHANNEL_USERNAME}")],
+                [InlineKeyboardButton(text="✅ ПРОВЕРИТЬ ПОДПИСКУ", callback_data="check_sub")]
+            ])
+            if isinstance(event, types.CallbackQuery):
+                await event.message.answer(
+                    "❌ Вы должны подписаться на канал, чтобы пользоваться ботом.\n\n"
+                    "Подпишитесь и нажмите «ПРОВЕРИТЬ ПОДПИСКУ».",
+                    reply_markup=markup
+                )
+                await event.answer()
+            else:
+                await event.answer(
+                    "❌ Вы должны подписаться на канал, чтобы пользоваться ботом.\n\n"
+                    "Подпишитесь и нажмите «ПРОВЕРИТЬ ПОДПИСКУ».",
+                    reply_markup=markup
+                )
+            return
+        return await handler(event, *args, **kwargs)
+    return wrapper
+
 # ========== FSM СОСТОЯНИЯ ==========
 class GameStates(StatesGroup):
     choosing_game = State()
@@ -118,6 +164,7 @@ class GameStates(StatesGroup):
     waiting_bet = State()
     waiting_withdraw = State()
     waiting_deposit_custom = State()
+    waiting_stars_deposit = State()
 
 # ========== КЛАВИАТУРЫ ==========
 def main_keyboard():
@@ -145,8 +192,17 @@ def dice_type_keyboard():
     builder.button(text="🔵 Меньше 3.5 (x1.7)", callback_data="dice_under")
     builder.button(text="🟢 Четное (x1.7)", callback_data="dice_even")
     builder.button(text="🟡 Нечетное (x1.7)", callback_data="dice_odd")
+    builder.button(text="⚔️ Дуэль (x1.7)", callback_data="dice_duel")
     builder.button(text="🔙 Назад", callback_data="play_menu")
-    builder.adjust(2, 2, 1)
+    builder.adjust(2, 2, 2, 1)
+    return builder.as_markup()
+
+def duel_choice_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔴 Больше (чем бот)", callback_data="duel_over")
+    builder.button(text="🔵 Меньше (чем бот)", callback_data="duel_under")
+    builder.button(text="🔙 Назад", callback_data="game_dice")
+    builder.adjust(2, 1)
     return builder.as_markup()
 
 def back_keyboard():
@@ -176,7 +232,6 @@ async def send_to_channel(game_emoji: str, user_name: str, bet: float, game_name
 
 async def send_result_to_channel(bet_msg_id: int, user_name: str, result_text: str, win_amount: float, win: bool):
     photo_url = config.WIN_IMAGE_URL if win else config.LOSE_IMAGE_URL
-    # Формируем полную подпись: описание результата + строка о выигрыше/проигрыше
     if win:
         result_line = f"💰 Выигрыш: {win_amount:.2f} USDT"
     else:
@@ -189,7 +244,6 @@ async def send_result_to_channel(bet_msg_id: int, user_name: str, result_text: s
     )
     keyboard = play_again_keyboard()
     try:
-        # Пытаемся отправить фото
         await bot.send_photo(
             chat_id=config.CHANNEL_ID,
             photo=photo_url,
@@ -199,7 +253,6 @@ async def send_result_to_channel(bet_msg_id: int, user_name: str, result_text: s
         )
     except Exception as e:
         print(f"Ошибка отправки результата с фото: {e}. Отправляю текст.")
-        # Если фото не отправилось, отправляем просто текст с той же подписью
         try:
             await bot.send_message(
                 config.CHANNEL_ID,
@@ -210,7 +263,7 @@ async def send_result_to_channel(bet_msg_id: int, user_name: str, result_text: s
         except Exception as e2:
             print(f"Критическая ошибка отправки результата в канал: {e2}")
 
-# ========== ФОНОВАЯ ЗАДАЧА ПРОВЕРКИ ИНВОЙСОВ ==========
+# ========== ФОНОВАЯ ЗАДАЧА ПРОВЕРКИ ИНВОЙСОВ (CRYPTOBOT) ==========
 async def check_invoices_background():
     global crypto
     while True:
@@ -235,19 +288,33 @@ async def check_invoices_background():
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    get_user(message.from_user.id)
-    await message.answer(
-        f"👋 Привет, {message.from_user.first_name}!\nДобро пожаловать в казино!",
-        reply_markup=main_keyboard()
-    )
+    user_id = message.from_user.id
+    if await check_subscription(user_id):
+        get_user(user_id)
+        await message.answer(
+            f"👋 Привет, {message.from_user.first_name}!\nДобро пожаловать в казино!",
+            reply_markup=main_keyboard()
+        )
+    else:
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{config.CHANNEL_USERNAME}")],
+            [InlineKeyboardButton(text="✅ ПРОВЕРИТЬ ПОДПИСКУ", callback_data="check_sub")]
+        ])
+        await message.answer(
+            "❌ Вы должны подписаться на канал, чтобы пользоваться ботом.\n\n"
+            "Подпишитесь и нажмите «ПРОВЕРИТЬ ПОДПИСКУ».",
+            reply_markup=markup
+        )
 
 @dp.message(Command("profile"))
-async def cmd_profile(message: types.Message):
+@subscription_required
+async def cmd_profile(message: types.Message, **kwargs):
     await show_profile(message)
 
 # ---- АДМИН-КОМАНДЫ ----
 @dp.message(Command("checkprofile"))
-async def cmd_checkprofile(message: types.Message, command: CommandObject):
+@subscription_required
+async def cmd_checkprofile(message: types.Message, command: CommandObject, **kwargs):
     if message.from_user.id not in config.ADMIN_IDS:
         await message.answer("⛔ У вас нет прав администратора.")
         return
@@ -270,7 +337,8 @@ async def cmd_checkprofile(message: types.Message, command: CommandObject):
     await message.answer(text)
 
 @dp.message(Command("takemoney"))
-async def cmd_takemoney(message: types.Message, command: CommandObject):
+@subscription_required
+async def cmd_takemoney(message: types.Message, command: CommandObject, **kwargs):
     if message.from_user.id not in config.ADMIN_IDS:
         await message.answer("⛔ У вас нет прав администратора.")
         return
@@ -304,7 +372,8 @@ async def cmd_takemoney(message: types.Message, command: CommandObject):
         pass
 
 @dp.message(Command("addmoney"))
-async def cmd_addmoney(message: types.Message, command: CommandObject):
+@subscription_required
+async def cmd_addmoney(message: types.Message, command: CommandObject, **kwargs):
     if message.from_user.id not in config.ADMIN_IDS:
         await message.answer("⛔ У вас нет прав администратора.")
         return
@@ -334,7 +403,8 @@ async def cmd_addmoney(message: types.Message, command: CommandObject):
         pass
 
 @dp.message(Command("sendnote"))
-async def cmd_sendnote(message: types.Message, command: CommandObject):
+@subscription_required
+async def cmd_sendnote(message: types.Message, command: CommandObject, **kwargs):
     if message.from_user.id not in config.ADMIN_IDS:
         await message.answer("⛔ У вас нет прав администратора.")
         return
@@ -361,21 +431,21 @@ async def cmd_sendnote(message: types.Message, command: CommandObject):
 
 # ========== ОБРАБОТЧИКИ КОЛЛБЭКОВ ==========
 @dp.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     await state.clear()
     await callback.message.edit_text("🎰 Главное меню:", reply_markup=main_keyboard())
     await callback.answer()
 
 @dp.callback_query(F.data == "profile")
-async def show_profile(callback_or_message):
+@subscription_required
+async def show_profile(callback_or_message, **kwargs):
     if isinstance(callback_or_message, types.CallbackQuery):
         user_id = callback_or_message.from_user.id
         message = callback_or_message.message
-        answer_method = callback_or_message.answer
     else:
         user_id = callback_or_message.from_user.id
         message = callback_or_message
-        answer_method = None
     user = get_user(user_id)
     text = (
         f"👤 <b>Ваш профиль</b>\n"
@@ -390,23 +460,40 @@ async def show_profile(callback_or_message):
     else:
         await message.answer(text, reply_markup=back_keyboard())
 
-# --- ПОПОЛНЕНИЕ ---
+# --- ПОПОЛНЕНИЕ (общее меню) ---
 @dp.callback_query(F.data == "deposit")
-async def deposit(callback: types.CallbackQuery):
+@subscription_required
+async def deposit(callback: types.CallbackQuery, **kwargs):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💎 Пополнить Stars", callback_data="deposit_stars")
+    builder.button(text="💳 Пополнить USDT (CryptoBot)", callback_data="deposit_usdt")
+    builder.button(text="🔙 Назад", callback_data="back_to_main")
+    builder.adjust(2, 1)
+    await callback.message.edit_text(
+        "💰 <b>Выберите способ пополнения:</b>",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+# --- ПОПОЛНЕНИЕ USDT (CryptoBot) ---
+@dp.callback_query(F.data == "deposit_usdt")
+@subscription_required
+async def deposit_usdt(callback: types.CallbackQuery, **kwargs):
     builder = InlineKeyboardBuilder()
     for amount in [5, 10, 25, 50, 100]:
         builder.button(text=f"{amount} USDT", callback_data=f"deposit_{amount}")
     builder.button(text="🔢 Другая сумма", callback_data="deposit_custom")
-    builder.button(text="🔙 Назад", callback_data="back_to_main")
+    builder.button(text="🔙 Назад", callback_data="deposit")
     builder.adjust(3, 2, 1, 1)
     await callback.message.edit_text(
-        "💰 <b>Пополнение баланса</b>\n\nВыберите сумму пополнения в USDT или введите свою:",
+        "💰 <b>Пополнение через CryptoBot</b>\n\nВыберите сумму в USDT или введите свою:",
         reply_markup=builder.as_markup()
     )
     await callback.answer()
 
 @dp.callback_query(F.data == "deposit_custom")
-async def deposit_custom(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def deposit_custom(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     await callback.message.edit_text(
         "💰 Введите сумму пополнения в USDT (минимум 1 USDT, целое число):",
         reply_markup=back_keyboard()
@@ -415,7 +502,8 @@ async def deposit_custom(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @dp.message(GameStates.waiting_deposit_custom)
-async def process_deposit_custom(message: types.Message, state: FSMContext):
+@subscription_required
+async def process_deposit_custom(message: types.Message, state: FSMContext, **kwargs):
     try:
         amount = float(message.text)
     except ValueError:
@@ -466,7 +554,7 @@ async def process_deposit_amount(event: types.CallbackQuery | types.Message, sta
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить", url=pay_url)],
             [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"check_invoice_{invoice.invoice_id}")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="deposit")]
         ])
 
         success_text = (
@@ -497,13 +585,16 @@ async def process_deposit_amount(event: types.CallbackQuery | types.Message, sta
     else:
         await state.clear()
 
-@dp.callback_query(F.data.startswith("deposit_"))
-async def deposit_button_handler(callback: types.CallbackQuery):
-    amount = float(callback.data.split("_")[1])
+@dp.callback_query(F.data.regexp(r'^deposit_\d+$'))
+@subscription_required
+async def deposit_button_handler(callback: types.CallbackQuery, **kwargs):
+    parts = callback.data.split("_")
+    amount = float(parts[1])
     await process_deposit_amount(callback, None, amount)
 
 @dp.callback_query(F.data.startswith("check_invoice_"))
-async def check_invoice(callback: types.CallbackQuery):
+@subscription_required
+async def check_invoice(callback: types.CallbackQuery, **kwargs):
     global crypto
     invoice_id = callback.data.replace("check_invoice_", "")
     user_id = callback.from_user.id
@@ -534,9 +625,73 @@ async def check_invoice(callback: types.CallbackQuery):
         await callback.answer(f"❌ Ошибка проверки: {e}", show_alert=True)
     await callback.answer()
 
+# --- ПОПОЛНЕНИЕ ЧЕРЕЗ ЗВЁЗДЫ ---
+@dp.callback_query(F.data == "deposit_stars")
+@subscription_required
+async def deposit_stars(callback: types.CallbackQuery, state: FSMContext, **kwargs):
+    await callback.message.answer(
+        f"⭐️ <b>Пополнение через Telegram Stars</b>\n\n"
+        f"Курс: 1 цент = {config.STARS_PER_CENT} звёзд\n"
+        f"Минимальная сумма: {config.MIN_STARS_DEPOSIT_CENTS} центов "
+        f"(= {config.MIN_STARS_DEPOSIT_CENTS * config.STARS_PER_CENT} звёзд)\n\n"
+        f"Отправьте число — сколько центов хотите пополнить (целое число):\n"
+        f"Например: 20",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state(GameStates.waiting_stars_deposit)
+    await callback.answer()
+
+@dp.message(GameStates.waiting_stars_deposit)
+@subscription_required
+async def process_stars_deposit(message: types.Message, state: FSMContext, **kwargs):
+    if not message.text.isdigit():
+        await message.answer("❌ Введите целое число (количество центов).")
+        return
+    cents = int(message.text)
+    if cents < config.MIN_STARS_DEPOSIT_CENTS:
+        await message.answer(f"❌ Минимальная сумма: {config.MIN_STARS_DEPOSIT_CENTS} центов "
+                             f"(= {config.MIN_STARS_DEPOSIT_CENTS * config.STARS_PER_CENT} звёзд).")
+        return
+    if cents > 10000:
+        await message.answer("❌ Максимальная сумма: 10000 центов (100 USDT).")
+        return
+    stars = cents * config.STARS_PER_CENT
+    user_id = message.from_user.id
+    prices = [LabeledPrice(label="Пополнение баланса казино", amount=stars)]
+    await message.answer_invoice(
+        title="Пополнение через ⭐️ Звёзды",
+        description=f"Пополнение баланса на {cents} центов (эквивалент {cents/100:.2f} USDT)",
+        prices=prices,
+        provider_token="",
+        payload=f"stars:{user_id}:{cents}",
+        currency="XTR"
+    )
+    await state.clear()
+
+# --- Обработка предварительного запроса (pre_checkout) ---
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre: PreCheckoutQuery):
+    await pre.answer(ok=True)
+
+# --- Обработка успешного платежа ---
+@dp.message(F.successful_payment)
+async def successful_payment(message: types.Message):
+    payload = message.successful_payment.invoice_payload
+    if payload.startswith("stars:"):
+        parts = payload.split(":")
+        if len(parts) == 3:
+            user_id = int(parts[1])
+            cents = int(parts[2])
+            amount_usd = cents / 100.0
+            update_balance(user_id, amount_usd)
+            await message.answer(f"✅ Баланс пополнен на {amount_usd:.2f} USDT через звёзды.")
+            return
+    await message.answer("❌ Не удалось обработать платёж. Обратитесь в поддержку.")
+
 # --- ВЫВОД ---
 @dp.callback_query(F.data == "withdraw")
-async def withdraw(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def withdraw(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     user = get_user(callback.from_user.id)
     if user[1] <= 0:
         await callback.answer("❌ У вас нет средств для вывода!", show_alert=True)
@@ -549,7 +704,8 @@ async def withdraw(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @dp.message(GameStates.waiting_withdraw)
-async def process_withdraw(message: types.Message, state: FSMContext):
+@subscription_required
+async def process_withdraw(message: types.Message, state: FSMContext, **kwargs):
     global crypto
     try:
         amount = float(message.text)
@@ -596,23 +752,41 @@ async def process_withdraw(message: types.Message, state: FSMContext):
     finally:
         await state.clear()
 
-# --- ИГРЫ ---
+# --- ИГРЫ (с корректной фильтрацией) ---
+def football_is_goal(value: int) -> bool:
+    return value in (3, 4, 5)
+
+def basketball_is_goal(value: int) -> bool:
+    return value in (4, 5)
+
 @dp.callback_query(F.data == "play_menu")
-async def play_menu(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def play_menu(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     await state.set_state(GameStates.choosing_game)
     await callback.message.edit_text("🎮 Выберите игру:", reply_markup=play_menu_keyboard())
     await callback.answer()
 
 @dp.callback_query(F.data == "game_dice", GameStates.choosing_game)
-async def choose_dice(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def choose_dice(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     await state.set_state(GameStates.choosing_dice_type)
     await callback.message.edit_text("🎲 Выберите тип игры в кости:", reply_markup=dice_type_keyboard())
     await callback.answer()
 
+# Обработчики для обычных игр в кости (кроме дуэли)
 @dp.callback_query(F.data.startswith("dice_"), GameStates.choosing_dice_type)
-async def choose_dice_type(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def choose_dice_type(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     game_type = callback.data
-    await state.update_data(game=game_type, emoji="🎲")
+    if game_type == "dice_duel":
+        await callback.message.edit_text(
+            "⚔️ Выберите условие победы над ботом:",
+            reply_markup=duel_choice_keyboard()
+        )
+        await state.set_state(GameStates.choosing_dice_type)
+        await callback.answer()
+        return
+    await state.update_data(game=game_type, emoji="🎲", duel=False)
     await callback.message.edit_text(
         f"🎲 Введите сумму ставки (мин. {config.MIN_BET} USDT, макс. {config.MAX_BET}):",
         reply_markup=back_keyboard()
@@ -620,8 +794,22 @@ async def choose_dice_type(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(GameStates.waiting_bet)
     await callback.answer()
 
+# Обработчики для выбора направления дуэли
+@dp.callback_query(F.data.startswith("duel_"), GameStates.choosing_dice_type)
+@subscription_required
+async def choose_duel_direction(callback: types.CallbackQuery, state: FSMContext, **kwargs):
+    direction = callback.data
+    await state.update_data(game=direction, emoji="🎲", duel=True)
+    await callback.message.edit_text(
+        f"⚔️ Введите сумму ставки на дуэль (мин. {config.MIN_BET} USDT, макс. {config.MAX_BET}):",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state(GameStates.waiting_bet)
+    await callback.answer()
+
 @dp.callback_query(F.data == "game_football", GameStates.choosing_game)
-async def choose_football(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def choose_football(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     builder = InlineKeyboardBuilder()
     builder.button(text="⚽ Гол (x1.2)", callback_data="football_goal")
     builder.button(text="🥅 Промах (x1.7)", callback_data="football_miss")
@@ -631,9 +819,10 @@ async def choose_football(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("football_"))
-async def choose_football_outcome(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def choose_football_outcome(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     outcome = callback.data
-    await state.update_data(game=outcome, emoji="⚽")
+    await state.update_data(game=outcome, emoji="⚽", duel=False)
     await callback.message.edit_text(
         f"⚽ Введите сумму ставки (мин. {config.MIN_BET} USDT, макс. {config.MAX_BET}):",
         reply_markup=back_keyboard()
@@ -642,7 +831,8 @@ async def choose_football_outcome(callback: types.CallbackQuery, state: FSMConte
     await callback.answer()
 
 @dp.callback_query(F.data == "game_basketball", GameStates.choosing_game)
-async def choose_basketball(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def choose_basketball(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     builder = InlineKeyboardBuilder()
     builder.button(text="🏀 Попадание (x1.2)", callback_data="basketball_goal")
     builder.button(text="🧱 Промах (x1.7)", callback_data="basketball_miss")
@@ -652,9 +842,10 @@ async def choose_basketball(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("basketball_"))
-async def choose_basketball_outcome(callback: types.CallbackQuery, state: FSMContext):
+@subscription_required
+async def choose_basketball_outcome(callback: types.CallbackQuery, state: FSMContext, **kwargs):
     outcome = callback.data
-    await state.update_data(game=outcome, emoji="🏀")
+    await state.update_data(game=outcome, emoji="🏀", duel=False)
     await callback.message.edit_text(
         f"🏀 Введите сумму ставки (мин. {config.MIN_BET} USDT, макс. {config.MAX_BET}):",
         reply_markup=back_keyboard()
@@ -663,7 +854,8 @@ async def choose_basketball_outcome(callback: types.CallbackQuery, state: FSMCon
     await callback.answer()
 
 @dp.message(GameStates.waiting_bet)
-async def process_bet(message: types.Message, state: FSMContext):
+@subscription_required
+async def process_bet(message: types.Message, state: FSMContext, **kwargs):
     try:
         bet = float(message.text)
     except ValueError:
@@ -675,16 +867,25 @@ async def process_bet(message: types.Message, state: FSMContext):
     if bet > config.MAX_BET:
         await message.answer(f"❌ Максимальная ставка {config.MAX_BET} USDT")
         return
+
     user = get_user(message.from_user.id)
     if user[1] < bet:
         await message.answer("❌ Недостаточно средств!")
         await state.clear()
         return
+
     update_balance(message.from_user.id, -bet)
+
     data = await state.get_data()
     game = data['game']
     emoji = data['emoji']
-    coef = config.COEF.get(game, 1.0)
+    duel = data.get('duel', False)
+
+    if duel:
+        coef = config.COEF.get('dice_over_under', 1.7)
+    else:
+        coef = config.COEF.get(game, 1.0)
+
     game_names = {
         'dice_over': 'Кости: больше 3.5',
         'dice_under': 'Кости: меньше 3.5',
@@ -693,52 +894,73 @@ async def process_bet(message: types.Message, state: FSMContext):
         'football_goal': 'Футбол: гол',
         'football_miss': 'Футбол: промах',
         'basketball_goal': 'Баскетбол: попадание',
-        'basketball_miss': 'Баскетбол: промах'
+        'basketball_miss': 'Баскетбол: промах',
     }
-    game_name = game_names.get(game, game)
+
+    if duel:
+        if game == 'duel_over':
+            game_name = "Дуэль: больше (против бота)"
+        else:
+            game_name = "Дуэль: меньше (против бота)"
+    else:
+        game_name = game_names.get(game, game)
+
     await send_to_channel(emoji, message.from_user.full_name, bet, game_name, coef)
+
     try:
-        dice_msg = await bot.send_dice(config.CHANNEL_ID, emoji=emoji)
-        dice_value = dice_msg.dice.value
+        if duel:
+            dice_msg1 = await bot.send_dice(config.CHANNEL_ID, emoji=emoji)
+            dice_msg2 = await bot.send_dice(config.CHANNEL_ID, emoji=emoji)
+            user_value = dice_msg1.dice.value
+            bot_value = dice_msg2.dice.value
+            if game == 'duel_over':
+                win = user_value > bot_value
+                result_text = f"Ваш кубик: {user_value}, кубик бота: {bot_value}"
+            else:
+                win = user_value < bot_value
+                result_text = f"Ваш кубик: {user_value}, кубик бота: {bot_value}"
+            if user_value == bot_value:
+                win = False
+                result_text += " — ничья, вы проиграли."
+            else:
+                result_text += f" — {'вы победили' if win else 'вы проиграли'}."
+        else:
+            dice_msg = await bot.send_dice(config.CHANNEL_ID, emoji=emoji)
+            dice_value = dice_msg.dice.value
+            win = False
+            result_text = ""
+            if game.startswith('dice_'):
+                if game == 'dice_over':
+                    win = dice_value > 3.5
+                    result_text = f"Выпало {dice_value} {'(больше 3.5)' if win else '(меньше или равно 3.5)'}"
+                elif game == 'dice_under':
+                    win = dice_value < 3.5
+                    result_text = f"Выпало {dice_value} {'(меньше 3.5)' if win else '(больше или равно 3.5)'}"
+                elif game == 'dice_even':
+                    win = dice_value % 2 == 0
+                    result_text = f"Выпало {dice_value} {'(четное)' if win else '(нечетное)'}"
+                elif game == 'dice_odd':
+                    win = dice_value % 2 != 0
+                    result_text = f"Выпало {dice_value} {'(нечетное)' if win else '(четное)'}"
+            elif game.startswith('football_'):
+                is_goal = football_is_goal(dice_value)
+                if game == 'football_goal':
+                    win = is_goal
+                else:
+                    win = not is_goal
+                result_text = f"{'ГОЛ' if is_goal else 'ПРОМАХ'} (выпало {dice_value})"
+            elif game.startswith('basketball_'):
+                is_goal = basketball_is_goal(dice_value)
+                if game == 'basketball_goal':
+                    win = is_goal
+                else:
+                    win = not is_goal
+                result_text = f"{'ПОПАДАНИЕ' if is_goal else 'ПРОМАХ'} (выпало {dice_value})"
     except Exception as e:
         await message.answer("❌ Ошибка отправки игры в канал. Проверьте права бота.")
         update_balance(message.from_user.id, bet)
         await state.clear()
         return
-
-    # Определяем исход игры и выигрыш
-    win = False
-    result_text = ""
-
-    if game.startswith('dice_'):
-        if game == 'dice_over':
-            win = dice_value > 3.5
-            result_text = f"Выпало {dice_value} {'(больше 3.5)' if win else '(меньше или равно 3.5)'}"
-        elif game == 'dice_under':
-            win = dice_value < 3.5
-            result_text = f"Выпало {dice_value} {'(меньше 3.5)' if win else '(больше или равно 3.5)'}"
-        elif game == 'dice_even':
-            win = dice_value % 2 == 0
-            result_text = f"Выпало {dice_value} {'(четное)' if win else '(нечетное)'}"
-        elif game == 'dice_odd':
-            win = dice_value % 2 != 0
-            result_text = f"Выпало {dice_value} {'(нечетное)' if win else '(четное)'}"
-    elif game.startswith('football_'):
-        is_goal = dice_value in (1, 3, 5)
-        if game == 'football_goal':
-            win = is_goal
-            result_text = f"{'ГОЛ' if is_goal else 'ПРОМАХ'} (выпало {dice_value})"
-        else:  # football_miss
-            win = not is_goal
-            result_text = f"{'ГОЛ' if is_goal else 'ПРОМАХ'} (выпало {dice_value})"
-    elif game.startswith('basketball_'):
-        is_goal = dice_value in (1, 3, 5)
-        if game == 'basketball_goal':
-            win = is_goal
-            result_text = f"{'ПОПАДАНИЕ' if is_goal else 'ПРОМАХ'} (выпало {dice_value})"
-        else:  # basketball_miss
-            win = not is_goal
-            result_text = f"{'ПОПАДАНИЕ' if is_goal else 'ПРОМАХ'} (выпало {dice_value})"
 
     win_amount = 0
     if win:
@@ -749,11 +971,29 @@ async def process_bet(message: types.Message, state: FSMContext):
         user_result = f"❌ {result_text}\n💸 Вы проиграли {bet:.2f} USDT."
 
     await message.answer(user_result)
-    # Отправляем результат в канал
-    await send_result_to_channel(dice_msg.message_id, message.from_user.full_name, result_text, win_amount, win)
+
+    if duel:
+        await send_result_to_channel(dice_msg1.message_id, message.from_user.full_name, result_text, win_amount, win)
+    else:
+        await send_result_to_channel(dice_msg.message_id, message.from_user.full_name, result_text, win_amount, win)
+
     update_stats(message.from_user.id, win)
     await state.clear()
     await message.answer("Выберите действие:", reply_markup=main_keyboard())
+
+# --- Обработчик кнопки "ПРОВЕРИТЬ ПОДПИСКУ" ---
+@dp.callback_query(F.data == "check_sub")
+async def check_subscription_callback(callback: types.CallbackQuery, state: FSMContext, **kwargs):
+    user_id = callback.from_user.id
+    if await check_subscription(user_id):
+        get_user(user_id)
+        await callback.message.edit_text(
+            f"✅ Подписка подтверждена! Добро пожаловать в казино!",
+            reply_markup=main_keyboard()
+        )
+        await callback.answer()
+    else:
+        await callback.answer("❌ Вы ещё не подписались. Подпишитесь и нажмите снова.", show_alert=True)
 
 # ========== ЗАПУСК ==========
 async def main():
