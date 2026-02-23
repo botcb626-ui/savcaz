@@ -1,12 +1,11 @@
-import os
-
 # config.py
 
 # --- НАСТРОЙКИ БОТА ---
-TOKEN = os.getenv('BOT_TOKEN')                     # Токен Telegram бота берётся из переменной окружения
-API_CRYPTOBOT = '534704:AAHQevelB7uFHf77O0NynwvzauV813iLl5g'    # Токен из Crypto Bot (@CryptoBot) — для создания инвойсов
-CHANNEL_ID = -1003873600338                    # ID вашего игрового канала (начинается с -100)
-ADMIN_IDS = [5559518385]                        # Список ID администраторов через запятую (например, ваш ID)
+TOKEN = '8464671001:AAFxikyogiZXrVmzJ5R1QnNAkc0mEi7E7LQ'                    # Токен Telegram бота берётся из переменной окружения
+API_CRYPTOBOT = '534705:AAb8W3NhO7JxjTY3mvYUDjGixYfnhLxBaMo'    # Токен из Crypto Bot (@CryptoBot) — для создания инвойсов
+CHANNEL_USERNAME = "gamesshades"                     # ID вашего игрового канала (начинается с -100)
+CHANNEL_ID = -1003755720528
+ADMIN_IDS = [8035506201]                        # Список ID администраторов через запятую (например, ваш ID)
 
 # --- ССЫЛКИ (НОВЫЕ) ---
 SUPPORT_USERNAME = "dspiq"                     # Юзернейм поддержки (без @)
@@ -29,3 +28,7 @@ COEF = {
     'basketball_goal': 1.2,
     'basketball_miss': 1.7,
 }
+
+# --- НАСТРОЙКИ ПОПОЛНЕНИЯ ЧЕРЕЗ ЗВЁЗДЫ ---
+STARS_PER_CENT = 2                     # 1 цент = 2 звезды
+MIN_STARS_DEPOSIT_CENTS = 20            # Минимальная сумма пополнения в центах (20 центов = 40 звёзд)
